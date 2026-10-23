@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""nanogpt-code: run Claude Code on NanoGPT models, alongside your Claude subscription.
+
+Usage:
+  nanogpt-code [claude args...]   start Claude Code on NanoGPT
+  nanogpt-code --set-key          store your NanoGPT API key in the OS keychain
+  nanogpt-code --check            check the key and show your NanoGPT balance
+  nanogpt-code --models           show the /model picker list and what each model supports
+  nanogpt-code --refresh          re-download NanoGPT's model catalog
+
+Everything else is passed to Claude Code, e.g. `nanogpt-code -p "..."` or
+`nanogpt-code --model moonshotai/kimi-k3`. See https://github.com/bicced/nanogpt-code
+"""
+import json
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+VERSION = "0.1.0"
+# Claude Code appends /v1/messages; NanoGPT serves it at /api/v1/messages.
+API = "https://nano-gpt.com/api"
+CATALOG_URL = API + "/v1/models?detailed=true"
+KEYCHAIN_SERVICE = "nanogpt"
+CATALOG_MAX_AGE = 24 * 3600
+# Claude Code compacts the conversation at this many tokens. Most NanoGPT
+# models take more, but a smaller window keeps each turn cheap.
+DEFAULT_CONTEXT = 200000
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic")
+
+# The /model picker list when ~/.config/nanogpt-code/models doesn't exist.
+# The first entry is the default model. All support tool calling.
+DEFAULT_MODELS = [
+    "z-ai/glm-5.3",
+    "moonshotai/kimi-k3",
+    "deepseek/deepseek-v4-pro-0813",
+    "qwen/qwen3.8-max-0902",
+    "minimax/minimax-m3.1-flash",
+    "z-ai/glm-5.3-flash",
+]
+
+
+def _xdg(var, default):
+    return os.path.join(os.environ.get(var) or os.path.expanduser(default), "nanogpt-code")
+
+
+CONFIG_DIR = _xdg("XDG_CONFIG_HOME", "~/.config")
+CACHE_DIR = _xdg("XDG_CACHE_HOME", "~/.cache")
+MODELS_FILE = os.path.join(CONFIG_DIR, "models")
+CATALOG_FILE = os.environ.get("NANOGPT_CODE_CATALOG") or os.path.join(CACHE_DIR, "catalog.json")
+
+
+def warn(msg):
+    print(f"nanogpt-code: {msg}", file=sys.stderr)
+
+
+def die(msg):
+    warn(msg)
+    sys.exit(1)
+
+
+def caps(model):
+    return (model or {}).get("capabilities") or {}
+
+
+# --- API key ---------------------------------------------------------------
+
+def get_key():
+    """The API key and where it came from. NANOGPT_API_KEY wins over the keychain."""
+    key = os.environ.get("NANOGPT_API_KEY", "").strip()
+    if key:
+        return key, "the NANOGPT_API_KEY environment variable"
+    if sys.platform == "darwin":
+        cmd, source = ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"], "the macOS Keychain"
+    elif shutil.which("secret-tool"):
+        cmd, source = ["secret-tool", "lookup", "service", KEYCHAIN_SERVICE], "the system keyring"
+    else:
+        cmd = source = None
+    if cmd:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip(), source
+    die("no NanoGPT API key. Run `nanogpt-code --set-key`, or set NANOGPT_API_KEY.\n"
+        "Get a key at https://nano-gpt.com/api")
+
+
+def set_key():
+    if sys.platform == "darwin":
+        # -w with no value makes security prompt, so the key stays out of argv and shell history.
+        cmd = ["security", "add-generic-password", "-U", "-a", os.environ.get("USER", "nanogpt"),
+               "-s", KEYCHAIN_SERVICE, "-w"]
+    elif shutil.which("secret-tool"):
+        cmd = ["secret-tool", "store", "--label=NanoGPT API key", "service", KEYCHAIN_SERVICE]
+    else:
+        die("no keychain found (macOS Keychain, or secret-tool from libsecret on Linux).\n"
+            "Set NANOGPT_API_KEY in your shell profile instead.")
+    print("Paste your NanoGPT API key from https://nano-gpt.com/api")
+    rc = subprocess.call(cmd)
+    if rc:
+        sys.exit(rc)
+    if os.environ.get("NANOGPT_API_KEY"):
+        warn("NANOGPT_API_KEY is set in this shell and is used instead of the stored key")
+    check_key()
+
+
+def check_key():
+    key, source = get_key()
+    req = urllib.request.Request(API + "/check-balance", data=b"", method="POST",
+                                 headers={"x-api-key": key, "User-Agent": f"nanogpt-code/{VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            balance = json.load(r).get("usd_balance")
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            die(f"NanoGPT rejected the key from {source}. Make a new one at "
+                "https://nano-gpt.com/api and store it with `nanogpt-code --set-key`"
+                + (", or unset NANOGPT_API_KEY." if "environment" in source else "."))
+        die(f"NanoGPT returned HTTP {e.code}")
+    except OSError as e:
+        die(f"couldn't reach NanoGPT ({e})")
+    print(f"Key from {source} works. NanoGPT balance: ${float(balance or 0):.2f}")
+
+
+# --- Model catalog ---------------------------------------------------------
+
+def load_catalog(force=False):
+    """NanoGPT's model list keyed by id, cached for a day. {} if unavailable."""
+    try:
+        age = time.time() - os.path.getmtime(CATALOG_FILE)
+    except OSError:
+        age = None
+    if force or age is None or age > CATALOG_MAX_AGE:
+        try:
+            req = urllib.request.Request(CATALOG_URL, headers={"User-Agent": f"nanogpt-code/{VERSION}"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.load(r)["data"]
+            os.makedirs(os.path.dirname(CATALOG_FILE), exist_ok=True)
+            tmp = CATALOG_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, CATALOG_FILE)
+        except Exception as e:
+            if age is None:
+                warn(f"couldn't download NanoGPT's model catalog ({e}); running without model details")
+                return {}
+            warn(f"couldn't refresh NanoGPT's model catalog ({e}); using the cached copy")
+    try:
+        with open(CATALOG_FILE) as f:
+            return {m["id"]: m for m in json.load(f)}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def configured_models():
+    try:
+        with open(MODELS_FILE) as f:
+            ids = [line.split("#", 1)[0].strip() for line in f]
+        ids = [i for i in ids if i]
+        if ids:
+            return ids
+    except OSError:
+        pass
+    return list(DEFAULT_MODELS)
+
+
+def usable(ids, catalog):
+    if not catalog:
+        return ids
+    out = []
+    for i in ids:
+        m = catalog.get(i)
+        if m is None:
+            warn(f"{i} isn't in NanoGPT's catalog; left out of the picker")
+        elif not caps(m).get("tool_calling"):
+            warn(f"{i} has no tool calling, which Claude Code needs; left out of the picker")
+        else:
+            out.append(i)
+    return out
+
+
+def effort_for(model):
+    """The Claude Code effort level to pin for a model that rejects "high", else None.
+
+    Claude Code sends whatever /effort or the user's settings say (often "xhigh"),
+    and NanoGPT answers a level the model lacks with a 400. "high" works on almost
+    every model, so it's the default; these are the exceptions.
+    """
+    listed = (model or {}).get("reasoning_efforts") or []
+    if not listed or "high" in listed:
+        return None
+    for level in ("medium", "low", "xhigh"):
+        if level in listed:
+            return level
+    return None
+
+
+def money(x):
+    return f"${float(x):.2f}"
+
+
+def describe(model):
+    parts = []
+    ctx = model.get("context_length")
+    if ctx:
+        parts.append(f"{ctx // 1000}K context")
+    parts.append("sees images" if caps(model).get("vision") else "text only")
+    price = model.get("pricing") or {}
+    if price.get("prompt") is not None and price.get("completion") is not None:
+        parts.append(f"{money(price['prompt'])}/{money(price['completion'])} per M tokens")
+    return " · ".join(parts)
+
+
+def flag_value(args, flag):
+    for n, a in enumerate(args):
+        if a == flag and n + 1 < len(args):
+            return args[n + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def show_models():
+    catalog = load_catalog()
+    ids = usable(configured_models(), catalog)
+    source = MODELS_FILE if os.path.exists(MODELS_FILE) else "built-in defaults"
+    print(f"Picker list ({source}); the first is the default:\n")
+    for n, i in enumerate(ids, 1):
+        m = catalog.get(i, {})
+        effort = effort_for(m) or "high"
+        print(f"{n:2}. {i}\n    {m.get('name', i)} · {describe(m) if m else 'no catalog details'} · effort {effort}")
+    print(f"\nEdit the list: one model id per line in {MODELS_FILE}")
+
+
+# --- Launch ----------------------------------------------------------------
+
+def user_settings_path():
+    return os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"),
+                        "settings.json")
+
+
+def read_saved_model(path):
+    try:
+        with open(path) as f:
+            return json.load(f).get("model")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def restore_model(path, before, nanogpt_ids):
+    """Undo a NanoGPT pick that /model saved to the user settings file.
+
+    /model writes to ~/.claude/settings.json, which plain `claude` shares, and a
+    NanoGPT id left there breaks subscription sessions.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        now = data.get("model")
+        if not now or now == before or (now not in nanogpt_ids and "/" not in str(now)):
+            return
+        if before is None:
+            data.pop("model")
+        else:
+            data["model"] = before
+        mode = os.stat(path).st_mode & 0o777
+        tmp = path + ".nanogpt-code.tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except (OSError, ValueError, AttributeError) as e:
+        warn(f"couldn't check {path} for a leftover NanoGPT model ({e})")
+
+
+def launch(args):
+    key, _ = get_key()
+    catalog = load_catalog()
+    picker = usable(configured_models(), catalog)
+    if not picker:
+        die(f"no usable models. Check the ids in {MODELS_FILE} against `nanogpt-code --models`.")
+    main = os.environ.get("NANOGPT_MODEL") or picker[0]
+    in_use = list(dict.fromkeys(picker + [main] + [m for m in [flag_value(args, "--model")] if m]))
+
+    def price(i):
+        p = (catalog.get(i) or {}).get("pricing") or {}
+        return p.get("prompt") if isinstance(p.get("prompt"), (int, float)) else float("inf")
+
+    small = os.environ.get("NANOGPT_SMALL_MODEL") or min(picker, key=price)
+    second = picker[1] if len(picker) > 1 else main
+
+    windows = [catalog[i]["context_length"] for i in in_use if (catalog.get(i) or {}).get("context_length")]
+    context = os.environ.get("NANOGPT_CONTEXT") or str(min([DEFAULT_CONTEXT] + windows))
+
+    for i in in_use:
+        listed = (catalog.get(i) or {}).get("reasoning_efforts")
+        if listed and "high" not in listed and not effort_for(catalog[i]):
+            warn(f"{i} only accepts effort {listed}, which Claude Code can't send; requests may fail")
+
+    script = os.path.realpath(__file__)
+    settings = {
+        "effortLevel": "high",
+        "modelSettings": {i: {"effortLevel": effort_for(catalog[i])}
+                          for i in in_use if effort_for(catalog.get(i))},
+        "hooks": {"PreToolUse": [{
+            "matcher": "Read",
+            "hooks": [{"type": "command",
+                       "command": f"{shlex.quote(sys.executable)} -I {shlex.quote(script)} --hook-image-guard"}],
+        }]},
+        "modelPicker": {
+            "replaceBuiltInOptions": True,
+            "options": [{"model": i,
+                         "label": (catalog.get(i) or {}).get("name", i),
+                         "description": describe(catalog[i]) if i in catalog else i}
+                        for i in picker],
+        },
+    }
+
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.update({
+        "ANTHROPIC_AUTH_TOKEN": key,
+        "ANTHROPIC_BASE_URL": API,
+        "API_TIMEOUT_MS": "3000000",
+        "ANTHROPIC_MODEL": main,
+        # Every alias maps to NanoGPT, so subagents and background calls never reach Anthropic.
+        "ANTHROPIC_DEFAULT_FABLE_MODEL": main,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": main,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": second,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": small,
+        "ANTHROPIC_SMALL_FAST_MODEL": small,
+        # Claude Code doesn't know NanoGPT ids. Declaring the window silences
+        # 'Model "..." isn't recognized' and sets where it compacts.
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": context,
+        "NANOGPT_CODE_CATALOG": CATALOG_FILE,
+    })
+
+    claude = shutil.which("claude")
+    if not claude:
+        die("Claude Code isn't installed. See https://code.claude.com/docs/en/setup")
+    settings_path = user_settings_path()
+    saved_model = read_saved_model(settings_path)
+    nanogpt_ids = set(catalog) | set(in_use)
+
+    proc = subprocess.Popen([claude, "--settings", json.dumps(settings)] + args, env=env)
+
+    def forward(sig, _frame):
+        try:
+            proc.send_signal(sig)
+        except ProcessLookupError:
+            pass
+
+    # Set after spawning: an ignored signal stays ignored across exec, and
+    # Claude Code needs Ctrl-C. The terminal sends it to both processes anyway.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, forward)
+    signal.signal(signal.SIGHUP, forward)
+    try:
+        rc = proc.wait()
+    finally:
+        restore_model(settings_path, saved_model, nanogpt_ids)
+    sys.exit(rc if rc >= 0 else 128 - rc)
+
+
+# --- Image guard (PreToolUse hook) ----------------------------------------
+
+def last_model(path):
+    """The model of the newest assistant row in a transcript, i.e. the one making this call."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            # Rows holding images run to megabytes, so read backwards in growing chunks.
+            for want in (1 << 18, 1 << 21, 1 << 24, size):
+                start = max(0, size - want)
+                f.seek(start)
+                lines = f.read().splitlines()
+                if start:
+                    lines = lines[1:]  # probably cut mid-row
+                for line in reversed(lines):
+                    if b'"assistant"' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    model = (row.get("message") or {}).get("model")
+                    if row.get("type") == "assistant" and model and model != "<synthetic>":
+                        return model
+                if not start:
+                    break
+    except OSError:
+        pass
+    return None
+
+
+def image_guard():
+    """Stop Read from opening an image when the active model is text-only.
+
+    The image would stay in the conversation and every later request would fail
+    with 'does not support image inputs'. Hook input has no model id, so take it
+    from the transcript. Unknown models count as text-only: a wrongly blocked
+    Read costs one tool call, a wrongly allowed one breaks the session.
+    """
+    data = json.load(sys.stdin)
+    path = str((data.get("tool_input") or {}).get("file_path", ""))
+    if not path.lower().endswith(IMAGE_EXTS):
+        return
+    model = last_model(data.get("transcript_path") or "") or os.environ.get("ANTHROPIC_MODEL", "")
+    try:
+        with open(CATALOG_FILE) as f:
+            vision = {m["id"] for m in json.load(f) if caps(m).get("vision")}
+    except (OSError, ValueError, KeyError, TypeError):
+        vision = set()
+    if model in vision:
+        return
+    reason = (
+        f"Blocked: {model or 'this model'} can't take image input. Reading {path} would put an "
+        "image in the conversation and every later request would fail with a 400. Inspect it "
+        "another way: the page's HTML/DOM or text, element positions and attributes from the "
+        "automation library, or OCR (e.g. tesseract) if installed. If the image itself is "
+        "needed, tell the user to switch to a model marked 'sees images' with /model."
+    )
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }}))
+
+
+def main():
+    args = sys.argv[1:]
+    command = args[0] if args else None
+    if command == "--hook-image-guard":
+        image_guard()
+    elif command == "--set-key":
+        set_key()
+    elif command == "--check":
+        check_key()
+    elif command == "--models":
+        show_models()
+    elif command == "--refresh":
+        load_catalog(force=True)
+        print(f"Catalog refreshed: {CATALOG_FILE}")
+    elif command in ("-h", "--help"):
+        print(__doc__.strip() + f"\n\nnanogpt-code {VERSION}")
+    else:
+        launch(args)
+
+
+if __name__ == "__main__":
+    main()

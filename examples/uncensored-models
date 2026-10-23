@@ -1,0 +1,12 @@
+# Uncensored and abliterated NanoGPT models with tool calling, strongest first.
+# Ranked by base model; no benchmark covers these yet. Checked October 2026.
+# Use it: cp examples/uncensored-models ~/.config/nanogpt-code/models
+# Most of the top ones are text-only; `nanogpt-code --models` shows which see images.
+
+abliteration-ai/abliterated-model-large-v2   # full GLM 5.3, refusals ablated
+z-ai/glm-5.3-uncensored                      # full GLM 5.3 fine-tune, flagged experimental
+heabsy/cyberheabsy                           # security and creative, base model undisclosed
+z-ai/glm-5.3-flash-uncensored                # 320B MoE, fast and cheap
+xiaomi/mimo-v2.6-flash-uncensored            # fast
+z-ai/glm-5.3-flash-apex-abliterated          # experimental GLM 5.3 Flash security derivative
+qwen/qwen3.8-27b-uncensored                  # 27B dense
